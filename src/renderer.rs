@@ -16,10 +16,6 @@ use egui::{
     ClippedPrimitive, Rect, TexturesDelta,
 };
 use vulkano::{
-    buffer::{
-        cpu_pool::CpuBufferPoolChunk, BufferUsage, CpuAccessibleBuffer, CpuBufferPool,
-        TypedBufferAccess,
-    },
     command_buffer::{
         AutoCommandBufferBuilder, BlitImageInfo, CommandBufferInheritanceInfo, CommandBufferUsage,
         CopyBufferToImageInfo, ImageBlit, PrimaryAutoCommandBuffer, PrimaryCommandBufferAbstract,
@@ -31,13 +27,11 @@ use vulkano::{
     image::{
         view::ImageView, ImageAccess, ImageLayout, ImageUsage, ImageViewAbstract, ImmutableImage,
     },
-    memory::allocator::{MemoryUsage, StandardMemoryAllocator},
     pipeline::{
         graphics::{
             color_blend::{AttachmentBlend, BlendFactor, ColorBlendState},
             input_assembly::InputAssemblyState,
             rasterization::{CullMode as CullModeEnum, RasterizationState},
-            vertex_input::BuffersDefinition,
             viewport::{Scissor, Viewport, ViewportState},
         },
         GraphicsPipeline, Pipeline, PipelineBindPoint,
@@ -45,24 +39,23 @@ use vulkano::{
     render_pass::{Framebuffer, FramebufferCreateInfo, RenderPass, Subpass},
     sampler::{Filter, Sampler, SamplerAddressMode, SamplerCreateInfo, SamplerMipmapMode},
     sync::GpuFuture,
-    DeviceSize,
 };
+use vulkano::buffer::{Buffer, BufferAllocateInfo, BufferUsage, Subbuffer};
+use vulkano::pipeline::graphics::vertex_input::Vertex;
 
 use crate::utils::Allocators;
 
-const VERTICES_PER_QUAD: DeviceSize = 4;
-const VERTEX_BUFFER_SIZE: DeviceSize = 1024 * 1024 * VERTICES_PER_QUAD;
-const INDEX_BUFFER_SIZE: DeviceSize = 1024 * 1024 * 2;
-
 /// Should match vertex definition of egui (except color is `[f32; 4]`)
 #[repr(C)]
-#[derive(Default, Debug, Clone, Copy, Zeroable, Pod)]
+#[derive(Default, Debug, Clone, Copy, Zeroable, Pod, Vertex)]
 pub struct EguiVertex {
+    #[format(R32G32_SFLOAT)]
     pub position: [f32; 2],
+    #[format(R32G32_SFLOAT)]
     pub tex_coords: [f32; 2],
+    #[format(R32G32B32A32_SFLOAT)]
     pub color: [f32; 4],
 }
-vulkano::impl_vertex!(EguiVertex, position, tex_coords, color);
 
 pub struct Renderer {
     gfx_queue: Arc<Queue>,
@@ -75,8 +68,6 @@ pub struct Renderer {
     sampler: Arc<Sampler>,
 
     allocators: Allocators,
-    vertex_buffer_pool: CpuBufferPool<EguiVertex>,
-    index_buffer_pool: CpuBufferPool<u32>,
     pipeline: Arc<GraphicsPipeline>,
     subpass: Subpass,
 
@@ -93,7 +84,6 @@ impl Renderer {
     ) -> Renderer {
         let need_srgb_conv = final_output_format.type_color().unwrap() == NumericType::UNORM;
         let allocators = Allocators::new_default(gfx_queue.device());
-        let (vertex_buffer_pool, index_buffer_pool) = Self::create_buffers(&allocators.memory);
         let pipeline = Self::create_pipeline(gfx_queue.clone(), subpass.clone());
         let sampler = Sampler::new(gfx_queue.device().clone(), SamplerCreateInfo {
             mag_filter: Filter::Linear,
@@ -102,13 +92,11 @@ impl Renderer {
             mipmap_mode: SamplerMipmapMode::Linear,
             ..Default::default()
         })
-        .unwrap();
+            .unwrap();
         Renderer {
             gfx_queue,
             format: final_output_format,
             render_pass: None,
-            vertex_buffer_pool,
-            index_buffer_pool,
             pipeline,
             subpass,
             texture_desc_sets: AHashMap::default(),
@@ -144,7 +132,7 @@ impl Renderer {
                         depth_stencil: {}
                 }
             )
-            .unwrap()
+                .unwrap()
         } else {
             vulkano::single_pass_renderpass!(gfx_queue.device().clone(),
                 attachments: {
@@ -160,12 +148,11 @@ impl Renderer {
                         depth_stencil: {}
                 }
             )
-            .unwrap()
+                .unwrap()
         };
 
         let need_srgb_conv = final_output_format.type_color().unwrap() == NumericType::UNORM;
         let allocators = Allocators::new_default(gfx_queue.device());
-        let (vertex_buffer_pool, index_buffer_pool) = Self::create_buffers(&allocators.memory);
 
         let subpass = Subpass::from(render_pass.clone(), 0).unwrap();
         let pipeline = Self::create_pipeline(gfx_queue.clone(), subpass.clone());
@@ -176,13 +163,11 @@ impl Renderer {
             mipmap_mode: SamplerMipmapMode::Linear,
             ..Default::default()
         })
-        .unwrap();
+            .unwrap();
         Renderer {
             gfx_queue,
             format: final_output_format,
             render_pass: Some(render_pass),
-            vertex_buffer_pool,
-            index_buffer_pool,
             pipeline,
             subpass,
             texture_desc_sets: AHashMap::default(),
@@ -199,29 +184,29 @@ impl Renderer {
         self.render_pass.is_some()
     }
 
-    fn create_buffers(
-        allocator: &Arc<StandardMemoryAllocator>,
-    ) -> (CpuBufferPool<EguiVertex>, CpuBufferPool<u32>) {
-        // Create vertex and index buffers
-        let vertex_buffer_pool = CpuBufferPool::new(
-            allocator.clone(),
-            BufferUsage { vertex_buffer: true, ..BufferUsage::empty() },
-            MemoryUsage::Upload,
-        );
-        vertex_buffer_pool
-            .reserve(VERTEX_BUFFER_SIZE)
-            .expect("Failed to reserve vertex buffer memory");
-        let index_buffer_pool = CpuBufferPool::new(
-            allocator.clone(),
-            BufferUsage { index_buffer: true, ..BufferUsage::empty() },
-            MemoryUsage::Upload,
-        );
-        index_buffer_pool
-            .reserve(INDEX_BUFFER_SIZE)
-            .expect("Failed to reserve index buffer memory");
-
-        (vertex_buffer_pool, index_buffer_pool)
-    }
+    // fn create_buffers(
+    //     allocator: &Arc<StandardMemoryAllocator>,
+    // ) -> (CpuBufferPool<EguiVertex>, CpuBufferPool<u32>) {
+    //     // Create vertex and index buffers
+    //     let vertex_buffer_pool = CpuBufferPool::new(
+    //         allocator.clone(),
+    //         BufferUsage::VERTEX_BUFFER,
+    //         MemoryUsage::Upload,
+    //     );
+    //     vertex_buffer_pool
+    //         .reserve(VERTEX_BUFFER_SIZE)
+    //         .expect("Failed to reserve vertex buffer memory");
+    //     let index_buffer_pool = CpuBufferPool::new(
+    //         allocator.clone(),
+    //         BufferUsage::INDEX_BUFFER,
+    //         MemoryUsage::Upload,
+    //     );
+    //     index_buffer_pool
+    //         .reserve(INDEX_BUFFER_SIZE)
+    //         .expect("Failed to reserve index buffer memory");
+    //
+    //     (vertex_buffer_pool, index_buffer_pool)
+    // }
 
     fn create_pipeline(gfx_queue: Arc<Queue>, subpass: Subpass) -> Arc<GraphicsPipeline> {
         let vs = vs::load(gfx_queue.device().clone()).expect("failed to create shader module");
@@ -232,7 +217,7 @@ impl Renderer {
         let blend_state = ColorBlendState::new(1).blend(blend);
 
         GraphicsPipeline::start()
-            .vertex_input_state(BuffersDefinition::new().vertex::<EguiVertex>())
+            .vertex_input_state(EguiVertex::per_vertex())
             .vertex_shader(vs.entry_point("main").unwrap(), ())
             .input_assembly_state(InputAssemblyState::new())
             .fragment_shader(fs.entry_point("main").unwrap(), ())
@@ -253,7 +238,7 @@ impl Renderer {
         PersistentDescriptorSet::new(&self.allocators.descriptor_set, layout.clone(), [
             WriteDescriptorSet::image_view_sampler(0, image.clone(), self.sampler.clone()),
         ])
-        .unwrap()
+            .unwrap()
     }
 
     /// Registers a user texture. User texture needs to be unregistered when it is no longer needed
@@ -293,13 +278,15 @@ impl Renderer {
             }
         };
         // Create buffer to be copied to the image
-        let texture_data_buffer = CpuAccessibleBuffer::from_iter(
+        let texture_data_buffer = Buffer::from_iter(
             &self.allocators.memory,
-            BufferUsage { transfer_src: true, ..BufferUsage::empty() },
-            false,
+            BufferAllocateInfo {
+                buffer_usage: BufferUsage::TRANSFER_SRC,
+                ..BufferAllocateInfo::default()
+            },
             data,
         )
-        .unwrap();
+            .unwrap();
         // Create image
         let (img, init) = ImmutableImage::uninitialized(
             &self.allocators.memory,
@@ -310,17 +297,12 @@ impl Renderer {
             },
             Format::R8G8B8A8_SRGB,
             vulkano::image::MipmapsCount::One,
-            ImageUsage {
-                transfer_dst: true,
-                transfer_src: true,
-                sampled: true,
-                ..ImageUsage::empty()
-            },
+            ImageUsage::TRANSFER_SRC | ImageUsage::TRANSFER_DST | ImageUsage::SAMPLED,
             Default::default(),
             ImageLayout::ShaderReadOnlyOptimal,
             Some(self.gfx_queue.queue_family_index()),
         )
-        .unwrap();
+            .unwrap();
         let font_image = ImageView::new_default(img).unwrap();
 
         // Create command buffer builder
@@ -329,7 +311,7 @@ impl Renderer {
             self.gfx_queue.queue_family_index(),
             CommandBufferUsage::OneTimeSubmit,
         )
-        .unwrap();
+            .unwrap();
 
         // Copy buffer to image
         cbb.copy_buffer_to_image(CopyBufferToImageInfo::buffer_image(texture_data_buffer, init))
@@ -353,14 +335,14 @@ impl Renderer {
                         dst_offsets: [top_left, bottom_right],
                         ..Default::default()
                     }]
-                    .into(),
+                        .into(),
                     filter: Filter::Nearest,
                     ..BlitImageInfo::images(
                         font_image.image().clone(),
                         existing_image.image().clone(),
                     )
                 })
-                .unwrap();
+                    .unwrap();
             }
             // Otherwise save the newly created image
         } else {
@@ -402,28 +384,40 @@ impl Renderer {
     fn create_subbuffers(
         &self,
         mesh: &Mesh,
-    ) -> (Arc<CpuBufferPoolChunk<EguiVertex>>, Arc<CpuBufferPoolChunk<u32>>) {
+    ) -> (Subbuffer<[EguiVertex]>, Subbuffer<[u32]>) {
         // Copy vertices to buffer
         let v_slice = &mesh.vertices;
 
-        let vertex_chunk = self
-            .vertex_buffer_pool
-            .from_iter(v_slice.iter().map(|v| EguiVertex {
-                position: [v.pos.x, v.pos.y],
-                tex_coords: [v.uv.x, v.uv.y],
-                color: [
-                    v.color.r() as f32 / 255.0,
-                    v.color.g() as f32 / 255.0,
-                    v.color.b() as f32 / 255.0,
-                    v.color.a() as f32 / 255.0,
-                ],
-            }))
-            .unwrap();
+        let vertex_chunk =
+            Buffer::from_iter(
+                &self.allocators.memory,
+                BufferAllocateInfo {
+                    buffer_usage: BufferUsage::VERTEX_BUFFER,
+                    ..BufferAllocateInfo::default()
+                },
+                // BufferUsage::VERTEX_BUFFER,
+                v_slice.iter().map(|v| EguiVertex {
+                    position: [v.pos.x, v.pos.y],
+                    tex_coords: [v.uv.x, v.uv.y],
+                    color: [
+                        v.color.r() as f32 / 255.0,
+                        v.color.g() as f32 / 255.0,
+                        v.color.b() as f32 / 255.0,
+                        v.color.a() as f32 / 255.0,
+                    ],
+                }),
+            ).unwrap();
 
         // Copy indices to buffer
         let i_slice = &mesh.indices;
-        let index_chunk = self.index_buffer_pool.from_iter(i_slice.clone()).unwrap();
-
+        let index_chunk = Buffer::from_iter(
+            &self.allocators.memory,
+            BufferAllocateInfo {
+                buffer_usage: BufferUsage::INDEX_BUFFER,
+                ..BufferAllocateInfo::default()
+            },
+            i_slice.clone(),
+        ).unwrap();
         (vertex_chunk, index_chunk)
     }
 
@@ -439,7 +433,7 @@ impl Renderer {
                 ..Default::default()
             },
         )
-        .unwrap()
+            .unwrap()
     }
 
     // Starts the rendering pipeline and returns [`AutoCommandBufferBuilder`] for drawing
@@ -460,13 +454,13 @@ impl Renderer {
                 .clone(),
             FramebufferCreateInfo { attachments: vec![final_image], ..Default::default() },
         )
-        .unwrap();
+            .unwrap();
         let mut command_buffer_builder = AutoCommandBufferBuilder::primary(
             &self.allocators.command_buffer,
             self.gfx_queue.queue_family_index(),
             CommandBufferUsage::OneTimeSubmit,
         )
-        .unwrap();
+            .unwrap();
         // Add clear values here for attachments and begin render pass
         command_buffer_builder
             .begin_render_pass(
@@ -489,8 +483,8 @@ impl Renderer {
         before_future: F,
         final_image: Arc<dyn ImageViewAbstract + 'static>,
     ) -> Box<dyn GpuFuture>
-    where
-        F: GpuFuture + 'static,
+        where
+            F: GpuFuture + 'static,
     {
         for (id, image_delta) in &textures_delta.set {
             self.update_texture(*id, image_delta);
